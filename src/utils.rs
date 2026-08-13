@@ -1,7 +1,7 @@
-use rquickjs::{Context, Runtime, Function};
 use once_cell::sync::Lazy;
 use rand::Rng;
 use regex::Regex;
+use rquickjs::{Context, Function, Runtime};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,12 +28,12 @@ use crate::{
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 pub fn get_html5player(body: &str) -> Option<String> {
     static HTML5PLAYER_RES: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r#"<script\s+src="([^"]+)"(?:\s+type="text\\//javascript")?\s+name="player_ias\\//base"\s*>|"jsUrl":"([^"]+)""#).unwrap()
+        Regex::new(r#"<script\s+src="([^"]+)"(?:\s+type="text/javascript")?\s+name="player_ias/base"\s*>|"jsUrl":"([^"]+)""#).unwrap()
     });
 
     let caps = HTML5PLAYER_RES.captures(body)?;
-    caps.get(2)
-        .or_else(|| caps.get(3))
+    caps.get(1)
+        .or_else(|| caps.get(2))
         .map(|cap| cap.as_str().to_string())
 }
 
@@ -406,7 +406,10 @@ fn decipher(
     let args: serde_json::value::Map<String, serde_json::Value> = {
         #[cfg(feature = "performance_analysis")]
         let _guard = flame::start_guard("serde_qs::from_str");
-        serde_qs::from_str(url).unwrap()
+        match serde_qs::from_str(url) {
+            Ok(args) => args,
+            Err(_) => return url.to_owned(),
+        }
     };
 
     let get_url_string = || {
@@ -433,9 +436,7 @@ fn decipher(
                 Ok(ctx) => ctx,
                 Err(_) => return get_url_string(),
             };
-            let eval_res = context.with(|ctx| {
-                ctx.eval::<(), _>(decipher_script_string.1)
-            });
+            let eval_res = context.with(|ctx| ctx.eval::<(), _>(decipher_script_string.1));
             if eval_res.is_err() {
                 return get_url_string();
             }
@@ -446,7 +447,10 @@ fn decipher(
 
     let result = context.with(|ctx| -> Option<String> {
         let func: rquickjs::Function = ctx.globals().get(decipher_script_string.0).ok()?;
-        let s_val = args.get("s").and_then(serde_json::Value::as_str).unwrap_or("");
+        let s_val = args
+            .get("s")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         func.call((s_val,)).ok()
     });
 
@@ -1346,18 +1350,28 @@ pub fn cut_after_js(mixed_json: &str) -> Option<&str> {
             // Skip strings
             b'"' | b'\'' | b'`' => {
                 index += 1;
-                while bytes[index] != char {
+                while index < bytes.len() && bytes[index] != char {
                     if bytes[index] == b'\\' {
                         index += 1;
+                        if index >= bytes.len() {
+                            return None;
+                        }
                     }
                     index += 1;
                 }
+                if index >= bytes.len() {
+                    return None;
+                }
             }
             // Skip comments
-            b'/' if bytes[index + 1] == b'*' => {
+            b'/' if index + 1 < bytes.len() && bytes[index + 1] == b'*' => {
                 index += 2;
-                while !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
                     index += 1;
+                }
+                if index + 1 >= bytes.len() {
+                    return None;
                 }
                 index += 2;
                 continue;
@@ -1369,11 +1383,17 @@ pub fn cut_after_js(mixed_json: &str) -> Option<&str> {
                 .unwrap_or(false) =>
             {
                 index += 1;
-                while bytes[index] != char {
+                while index < bytes.len() && bytes[index] != char {
                     if bytes[index] == b'\\' {
                         index += 1;
+                        if index >= bytes.len() {
+                            return None;
+                        }
                     }
                     index += 1;
+                }
+                if index >= bytes.len() {
+                    return None;
                 }
             }
             // Save the last significant character for the regex check
@@ -1503,6 +1523,51 @@ mod tests {
 
         assert!(cut_after_js(r#"{"a": 1,{ "b": 1}"#).is_none());
         println!("[PASSED] test_returns_error_when_missing_closing_bracket");
+    }
+
+    #[test]
+    fn html5player_extracts_jsurl_control_branch() {
+        assert_eq!(
+            get_html5player(r#"{"jsUrl":"/s/player/json/base.js"}"#).as_deref(),
+            Some("/s/player/json/base.js")
+        );
+    }
+
+    #[test]
+    fn html5player_extracts_script_src_fallback_branch() {
+        assert_eq!(
+            get_html5player(r#"<script src="/s/player/script/base.js" name="player_ias/base">"#)
+                .as_deref(),
+            Some("/s/player/script/base.js")
+        );
+    }
+
+    #[test]
+    fn malformed_cipher_structure_falls_back_without_panicking() {
+        let malformed = "url[]broken";
+        let mut cipher_cache = None;
+        let result = decipher(malformed, ("", ""), &mut cipher_cache, None);
+        assert_eq!(result, malformed);
+    }
+
+    #[test]
+    fn truncated_js_string_returns_none_without_panicking() {
+        assert!(cut_after_js("{\"").is_none());
+    }
+
+    #[test]
+    fn trailing_slash_returns_none_without_panicking() {
+        assert!(cut_after_js("{/").is_none());
+    }
+
+    #[test]
+    fn unterminated_block_comment_returns_none_without_panicking() {
+        assert!(cut_after_js("{/*").is_none());
+    }
+
+    #[test]
+    fn unterminated_regex_returns_none_without_panicking() {
+        assert!(cut_after_js("{=/").is_none());
     }
 }
 
