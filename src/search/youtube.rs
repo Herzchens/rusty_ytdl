@@ -1297,113 +1297,35 @@ fn filter_string(filter: &SearchType) -> String {
     }
 }
 
+fn extract_quoted_config_value<'a>(html: &'a str, markers: &[&str]) -> Option<&'a str> {
+    markers.iter().find_map(|marker| {
+        let (_, rest) = html.split_once(marker)?;
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    })
+}
+
 fn get_client_version(html: impl Into<String>) -> String {
     let html: String = html.into();
-    let first_collect_for_client_version = html
-        .split(r#""INNERTUBE_CONTEXT_CLIENT_VERSION":""#)
-        .collect::<Vec<&str>>();
-
-    return match first_collect_for_client_version.get(1) {
-        Some(x) => {
-            let second_collect = x.split('"').collect::<Vec<&str>>();
-            if !second_collect.is_empty() {
-                let inner_tube = second_collect.first().unwrap().to_string();
-                // println!("INNERTUBE_CONTEXT_CLIENT_VERSION => {inner_tube}");
-
-                inner_tube
-            } else {
-                let third_collect = html
-                    .split(r#""innertube_context_client_version":""#)
-                    .collect::<Vec<&str>>();
-
-                match third_collect.get(1) {
-                    Some(c) => {
-                        let forth_collect = c.split('"').collect::<Vec<&str>>();
-                        if !forth_collect.is_empty() {
-                            let inner_tube = forth_collect.first().unwrap().to_string();
-                            // println!("innertube_context_client_version => {inner_tube}");
-                            inner_tube
-                        } else {
-                            DEFAULT_CLIENT_VERSOIN.to_string()
-                        }
-                    }
-                    None => DEFAULT_CLIENT_VERSOIN.to_string(),
-                }
-            }
-        }
-        None => {
-            let third_collect = html
-                .split(r#""innertube_context_client_version":""#)
-                .collect::<Vec<&str>>();
-
-            match third_collect.get(1) {
-                Some(c) => {
-                    let forth_collect = c.split('"').collect::<Vec<&str>>();
-                    if !forth_collect.is_empty() {
-                        let inner_tube = forth_collect.first().unwrap().to_string();
-                        // println!("innertube_context_client_version => {inner_tube}");
-                        inner_tube
-                    } else {
-                        DEFAULT_CLIENT_VERSOIN.to_string()
-                    }
-                }
-                None => DEFAULT_CLIENT_VERSOIN.to_string(),
-            }
-        }
-    };
+    extract_quoted_config_value(
+        &html,
+        &[
+            r#""INNERTUBE_CONTEXT_CLIENT_VERSION":""#,
+            r#""innertube_context_client_version":""#,
+        ],
+    )
+    .unwrap_or(DEFAULT_CLIENT_VERSOIN)
+    .to_string()
 }
 
 fn get_api_key(html: impl Into<String>) -> String {
     let html: String = html.into();
-
-    let first_collect = html
-        .split(r#""INNERTUBE_API_KEY":""#)
-        .collect::<Vec<&str>>();
-
-    return match first_collect.get(1) {
-        Some(x) => {
-            let second_collect = x.split('"').collect::<Vec<&str>>();
-            if !second_collect.is_empty() {
-                let inner_tube = second_collect.first().unwrap().to_string();
-                // println!("INNERTUBE_API_KEY => {inner_tube}");
-                inner_tube
-            } else {
-                let third_collect = html.split(r#""innertubeApiKey":""#).collect::<Vec<&str>>();
-
-                match third_collect.get(1) {
-                    Some(c) => {
-                        let forth_collect = c.split('"').collect::<Vec<&str>>();
-                        if !forth_collect.is_empty() {
-                            let inner_tube = forth_collect.first().unwrap().to_string();
-                            // println!("innertubeApiKey => {inner_tube}");
-
-                            inner_tube
-                        } else {
-                            DEFAULT_INNERTUBE_KEY.to_string()
-                        }
-                    }
-                    None => DEFAULT_INNERTUBE_KEY.to_string(),
-                }
-            }
-        }
-        None => {
-            let third_collect = html.split(r#""innertubeApiKey":""#).collect::<Vec<&str>>();
-
-            match third_collect.get(1) {
-                Some(c) => {
-                    let forth_collect = c.split('"').collect::<Vec<&str>>();
-                    if !forth_collect.is_empty() {
-                        let inner_tube = forth_collect.first().unwrap().to_string();
-                        // println!("innertubeApiKey => {inner_tube}");
-                        inner_tube
-                    } else {
-                        DEFAULT_INNERTUBE_KEY.to_string()
-                    }
-                }
-                None => DEFAULT_INNERTUBE_KEY.to_string(),
-            }
-        }
-    };
+    extract_quoted_config_value(
+        &html,
+        &[r#""INNERTUBE_API_KEY":""#, r#""innertubeApiKey":""#],
+    )
+    .unwrap_or(DEFAULT_INNERTUBE_KEY)
+    .to_string()
 }
 
 fn build_search_request_body(
@@ -2330,5 +2252,37 @@ mod search_fallback_parser_tests {
         );
         let result = call.expect("parser must return normally");
         assert!(matches!(result, Err(VideoError::BodyCannotParsed)));
+    }
+}
+
+#[cfg(test)]
+mod truncated_innertube_config_tests {
+    use super::{get_api_key, get_client_version, DEFAULT_CLIENT_VERSOIN, DEFAULT_INNERTUBE_KEY};
+
+    #[test]
+    fn truncated_api_key_does_not_turn_html_tail_into_a_key() {
+        let malformed = r#"prefix "INNERTUBE_API_KEY":"unterminated-tail"#;
+        assert_eq!(
+            get_api_key(malformed),
+            DEFAULT_INNERTUBE_KEY,
+            "a truncated quoted API key must fall back instead of accepting the rest of the HTML"
+        );
+    }
+
+    #[test]
+    fn truncated_client_version_does_not_turn_html_tail_into_a_version() {
+        let malformed = r#"prefix "INNERTUBE_CONTEXT_CLIENT_VERSION":"unterminated-tail"#;
+        assert_eq!(
+            get_client_version(malformed),
+            DEFAULT_CLIENT_VERSOIN,
+            "a truncated quoted client version must fall back instead of accepting the rest of the HTML"
+        );
+    }
+
+    #[test]
+    fn complete_innertube_config_values_remain_preserved() {
+        let html = r#"{"INNERTUBE_API_KEY":"key123","INNERTUBE_CONTEXT_CLIENT_VERSION":"9.9.9"}"#;
+        assert_eq!(get_api_key(html), "key123");
+        assert_eq!(get_client_version(html), "9.9.9");
     }
 }
