@@ -275,13 +275,18 @@ impl Stream for NonLiveStream {
             .await
             .map_err(VideoError::ReqwestMiddleware)?;
         let status = response.status();
+        let mut response = response.error_for_status().map_err(VideoError::Reqwest)?;
+        if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(VideoError::DownloadError(format!(
+                "unexpected HTTP status {status} for ranged media request"
+            )));
+        }
         let range_was_ignored = status == reqwest::StatusCode::OK;
         let content_range = response
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let mut response = response.error_for_status().map_err(VideoError::Reqwest)?;
 
         let mut buf: BytesMut = BytesMut::new();
 
@@ -1379,6 +1384,75 @@ mod missing_content_range_tests {
         assert!(
             result.is_err(),
             "single-part HTTP 206 without Content-Range must be rejected because the returned byte offsets cannot be identified; got {result:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unexpected_success_status_tests {
+    use super::{NonLiveStream, NonLiveStreamOptions, Stream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_request(socket: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = socket
+                .read(&mut buffer)
+                .await
+                .expect("read unexpected-status request");
+            assert!(read > 0, "client closed before request headers completed");
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("local HTTP request must be UTF-8")
+    }
+
+    #[tokio::test]
+    async fn unexpected_success_status_does_not_advance_range() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unexpected-status server");
+        let address = listener
+            .local_addr()
+            .expect("read unexpected-status address");
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept range request");
+            let request = read_request(&mut socket).await;
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("Range: bytes=0-2")),
+                "client must request the expected range; got {request:?}"
+            );
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write 204 response");
+        });
+
+        let stream = NonLiveStream::new(NonLiveStreamOptions {
+            client: None,
+            link: format!("http://{address}/media.bin"),
+            content_length: 6,
+            dl_chunk_size: 3,
+            start: 0,
+            end: 2,
+            #[cfg(feature = "ffmpeg")]
+            ffmpeg_args: None,
+        })
+        .expect("construct unexpected-status stream");
+
+        let result = stream.chunk().await;
+        server.await.expect("unexpected-status server should join");
+
+        assert!(
+            result.is_err(),
+            "a ranged GET may only be consumed as a full 200 or partial 206 representation; 204 must not be treated as an empty successful chunk or advance the byte cursor; got {result:?}"
         );
     }
 }

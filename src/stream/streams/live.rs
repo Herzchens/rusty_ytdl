@@ -311,6 +311,7 @@ impl Stream for LiveStream {
             None
         };
 
+        let requested_byte_range = first_segment.0.data.byte_range_bounds();
         let mut headers = DEFAULT_HEADERS.clone();
         if let Some(range) = first_segment.0.data.byte_range_string() {
             let range = range
@@ -323,20 +324,55 @@ impl Stream for LiveStream {
         let ua = crate::utils::get_user_agent_for_url(first_segment.0.url().as_str());
         headers.insert(reqwest::header::USER_AGENT, ua.parse().unwrap());
 
-        let mut response = self
+        let response = self
             .client
             .get(first_segment.0.url().as_str())
             .headers(headers)
             .send()
             .await
-            .map_err(VideoError::ReqwestMiddleware)?
-            .error_for_status()
-            .map_err(VideoError::Reqwest)?;
+            .map_err(VideoError::ReqwestMiddleware)?;
+        let status = response.status();
+        let mut response = response.error_for_status().map_err(VideoError::Reqwest)?;
+        if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(VideoError::DownloadError(format!(
+                "unexpected HTTP status {status} for HLS media segment"
+            )));
+        }
 
         let mut buf: BytesMut = BytesMut::new();
 
         while let Some(chunk) = response.chunk().await.map_err(VideoError::Reqwest)? {
             buf.extend(chunk);
+        }
+
+        // A server is allowed to ignore Range and return the complete representation with
+        // HTTP 200. EXT-X-BYTERANGE still defines only the requested sub-range as this
+        // media segment, so recover that sub-range from the complete body before decrypting.
+        if status == reqwest::StatusCode::OK {
+            if let Some((range_start, range_length)) = requested_byte_range {
+                let range_start = usize::try_from(range_start).map_err(|_| {
+                    VideoError::DownloadError(
+                        "HLS byte-range start does not fit this platform".to_string(),
+                    )
+                })?;
+                let range_length = usize::try_from(range_length).map_err(|_| {
+                    VideoError::DownloadError(
+                        "HLS byte-range length does not fit this platform".to_string(),
+                    )
+                })?;
+                let range_end = range_start.checked_add(range_length).ok_or_else(|| {
+                    VideoError::DownloadError("HLS byte-range end overflow".to_string())
+                })?;
+                if range_end > buf.len() {
+                    return Err(VideoError::DownloadError(format!(
+                        "server ignored HLS Range but returned only {} bytes for requested bytes={}-{}",
+                        buf.len(),
+                        range_start,
+                        range_end.saturating_sub(1)
+                    )));
+                }
+                buf = BytesMut::from(&buf[range_start..range_end]);
+            }
         }
 
         // Decrypt data bytes
@@ -541,8 +577,16 @@ mod byte_range_request_tests {
                 .await
                 .expect("read segment request");
             let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            let response: &[u8] = if request
+                .to_ascii_lowercase()
+                .contains("\r\nrange: bytes=10-13\r\n")
+            {
+                b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 10-13/18\r\nConnection: close\r\n\r\npart"
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npart"
+            };
             socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npart")
+                .write_all(response)
                 .await
                 .expect("write segment response");
             request
@@ -632,6 +676,21 @@ mod implicit_byte_range_tests {
         socket.write_all(body).await.expect("write response body");
     }
 
+    async fn respond_partial(socket: &mut TcpStream, content_range: &str, body: &[u8]) {
+        let headers = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: {content_range}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write partial response headers");
+        socket
+            .write_all(body)
+            .await
+            .expect("write partial response body");
+    }
+
     async fn capture_two_ranges(second_byterange: &'static str) -> (String, String) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -650,14 +709,14 @@ mod implicit_byte_range_tests {
             let (mut first_socket, _) =
                 listener.accept().await.expect("accept first media request");
             let first_request = read_request(&mut first_socket).await;
-            respond(&mut first_socket, b"one!").await;
+            respond_partial(&mut first_socket, "bytes 10-13/18", b"one!").await;
 
             let (mut second_socket, _) = listener
                 .accept()
                 .await
                 .expect("accept second media request");
             let second_request = read_request(&mut second_socket).await;
-            respond(&mut second_socket, b"two!").await;
+            respond_partial(&mut second_socket, "bytes 14-17/18", b"two!").await;
 
             (first_request, second_request)
         });
@@ -1002,5 +1061,165 @@ mod initialization_map_tests {
         assert_eq!(&first[..], b"INITONE");
         assert_eq!(&second[..], b"TWO");
         assert_eq!(paths, vec!["/init.mp4", "/one.m4s", "/two.m4s"]);
+    }
+}
+
+#[cfg(test)]
+mod unexpected_success_status_tests {
+    use super::{
+        Encryption, LiveStream, LiveStreamOptions, MediaFormat, RemoteData, Segment, Stream,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn unexpected_success_status_keeps_hls_segment_retryable() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HLS status server");
+        let address = listener.local_addr().expect("read HLS status address");
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept segment request");
+            let mut request = [0_u8; 1024];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("read segment request");
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write 204 segment response");
+        });
+
+        let stream = LiveStream::new(LiveStreamOptions {
+            client: None,
+            stream_url: format!("http://{address}/playlist.m3u8"),
+        })
+        .expect("construct HLS stream");
+        let segment_url =
+            url::Url::parse(&format!("http://{address}/segment.ts")).expect("parse segment URL");
+        stream.segments.write().await.push((
+            Segment {
+                data: RemoteData::new(segment_url, None),
+                discon_seq: 0,
+                seq: 1,
+                format: MediaFormat::Unknown,
+                initialization: None,
+            },
+            Encryption::None,
+        ));
+        *stream.last_refresh.write().await = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_millis();
+        *stream.is_end.write().await = true;
+
+        let result = stream.chunk().await;
+        server.await.expect("HLS status server should join");
+        let remaining = stream.segments.read().await.len();
+
+        assert!(
+            result.is_err() && remaining == 1,
+            "204 must be rejected before consuming the HLS media segment; got result={result:?}, remaining={remaining}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ignored_byte_range_response_tests {
+    use super::{
+        Encryption, LiveStream, LiveStreamOptions, MediaFormat, RemoteData, Segment, Stream,
+    };
+    use m3u8_rs::ByteRange;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_request(socket: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = socket
+                .read(&mut buffer)
+                .await
+                .expect("read HLS byte-range request");
+            assert!(read > 0, "client closed before request headers completed");
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("local HTTP request must be UTF-8")
+    }
+
+    #[tokio::test]
+    async fn ignored_hls_byte_range_emits_only_requested_subrange() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ignored HLS byte-range server");
+        let address = listener
+            .local_addr()
+            .expect("read ignored HLS byte-range address");
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept segment request");
+            let request = read_request(&mut socket).await;
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("Range: bytes=2-3")),
+                "client must request the declared HLS sub-range; got {request:?}"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef",
+                )
+                .await
+                .expect("write full ignored-range representation");
+        });
+
+        let stream = LiveStream::new(LiveStreamOptions {
+            client: None,
+            stream_url: format!("http://{address}/playlist.m3u8"),
+        })
+        .expect("construct HLS stream");
+        let segment_url =
+            url::Url::parse(&format!("http://{address}/segment.ts")).expect("parse segment URL");
+        stream.segments.write().await.push((
+            Segment {
+                data: RemoteData::new(
+                    segment_url,
+                    Some(ByteRange {
+                        length: 2,
+                        offset: Some(2),
+                    }),
+                ),
+                discon_seq: 0,
+                seq: 1,
+                format: MediaFormat::Unknown,
+                initialization: None,
+            },
+            Encryption::None,
+        ));
+        *stream.last_refresh.write().await = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_millis();
+        *stream.is_end.write().await = true;
+
+        let result = stream.chunk().await;
+        server
+            .await
+            .expect("ignored HLS byte-range server should join");
+
+        assert_eq!(
+            result
+                .expect("ignored Range fallback should preserve the declared HLS segment")
+                .as_deref(),
+            Some(b"cd".as_slice()),
+            "EXT-X-BYTERANGE declares only bytes 2-3 as this media segment; a server returning the whole resource must not make the client emit the whole resource"
+        );
     }
 }
