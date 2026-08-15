@@ -4,36 +4,146 @@ on:
   push:
     branches:
       - main
+      - 'fix/**'
   pull_request:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
-  build:
-    name: Build and test on ${{ matrix.os }}
+  standalone:
+    name: Standalone ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        toolchain:
-          - nightly
         os:
           - ubuntu-latest
           - windows-latest
           - macOS-latest
 
     steps:
-      - uses: actions/checkout@v2
-      - name: Install minimal ${{ matrix.toolchain }} toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - name: Set up Rust 1.96.0
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: ${{ matrix.toolchain }}
-          default: true
-      - name: Install clippy
-        run: rustup component add clippy
-      - name: Build
-        run: cargo build --verbose
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Apply candidate
+        shell: bash
+        run: |
+          if [[ -f .ci/candidate.py ]]; then
+            python .ci/candidate.py
+          fi
+          if [[ -f .ci/format-candidate || -f .ci/candidate.py ]]; then
+            cargo fmt --all
+          fi
+      - name: Reject candidate workflow mutations
+        shell: bash
+        run: |
+          if ! git diff --quiet -- .github/workflows; then
+            echo "validated candidate must not mutate workflow files" >&2
+            git diff --name-only -- .github/workflows >&2
+            exit 1
+          fi
+      - name: Diff integrity
+        shell: bash
+        run: git diff --check
+      - name: Format
+        run: cargo fmt --check
+      - name: Check
+        run: cargo check --all-targets
       - name: Test
-        run: cargo test --verbose
+        run: cargo test
       - name: Clippy
-        run: cargo clippy --verbose -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+  serenya-features:
+    name: Serenya feature set
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust 1.96.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Apply candidate
+        shell: bash
+        run: |
+          if [[ -f .ci/candidate.py ]]; then
+            python .ci/candidate.py
+          fi
+          if [[ -f .ci/format-candidate || -f .ci/candidate.py ]]; then
+            cargo fmt --all
+          fi
+      - name: Reject candidate workflow mutations
+        shell: bash
+        run: |
+          if ! git diff --quiet -- .github/workflows; then
+            echo "validated candidate must not mutate workflow files" >&2
+            git diff --name-only -- .github/workflows >&2
+            exit 1
+          fi
+      - name: Diff integrity
+        shell: bash
+        run: git diff --check
+      - name: Check rustls + search
+        run: cargo check --no-default-features --features rustls,search
+      - name: Test rustls + search
+        run: cargo test --no-default-features --features rustls,search
+      - name: Clippy rustls + search
+        run: cargo clippy --no-default-features --features rustls,search -- -D warnings
+
+  materialize:
+    name: Materialize validated candidate
+    needs:
+      - standalone
+      - serenya-features
+    if: ${{ needs.standalone.result == 'success' && needs.serenya-features.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Rust 1.96.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+          components: rustfmt
+      - name: Materialize candidate
+        shell: bash
+        run: |
+          has_candidate=false
+          if [[ -f .ci/candidate.py ]]; then
+            python .ci/candidate.py
+            has_candidate=true
+          fi
+          if [[ -f .ci/format-candidate ]]; then
+            has_candidate=true
+          fi
+          if [[ "$has_candidate" != true ]]; then
+            echo "No candidate to materialize"
+            exit 0
+          fi
+          cargo fmt --all
+          if ! git diff --quiet -- .github/workflows; then
+            echo "validated candidate mutated workflow files" >&2
+            exit 1
+          fi
+          git diff --check
+          [[ -f .ci/candidate.py ]] && git rm .ci/candidate.py
+          [[ -f .ci/format-candidate ]] && git rm .ci/format-candidate
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Validated candidate produced no changes" >&2
+            exit 1
+          fi
+          git config user.name "Serenya Validation"
+          git config user.email "166841132+Herzchens@users.noreply.github.com"
+          git commit -m "fix: materialize validated standalone candidate [skip ci]"
+          git push origin HEAD:${GITHUB_REF_NAME}
